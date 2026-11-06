@@ -1,5 +1,5 @@
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from config.mcp_config import MCP_SERVERS
+from config.mcp_config_main import MCP_SERVERS
 
 class MCPclient :
 
@@ -13,6 +13,7 @@ class MCPclient :
 
         try :
             tools = await self.client.get_tools()
+
             return tools
         except Exception as e :
             print(f"Error while getting tools : {e}")
