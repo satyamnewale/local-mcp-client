@@ -56,5 +56,5 @@ Respond clearly and concisely to the original request. Report completed operatio
 def get_orchestrator_prompt():
 
     return ChatPromptTemplate.from_messages(
-        [("system", ORCHESTRATOR_PROMPT), MessagesPlaceholder(variable_name="messages"ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssx)]
+        [("system", ORCHESTRATOR_PROMPT), MessagesPlaceholder(variable_name="messages")]
     )
