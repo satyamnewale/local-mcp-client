@@ -43,7 +43,7 @@ class MCPAgent:
             print(f"- {tool.name}")
 
         # 2. Bind tools to the model
-        model_with_tools = self.model.bind_tools(tools)
+        model_with_tools = self.model.bind_tools(tools, parallel_tool_calls = False)
 
         # Create orchestration prompt
         prompt = get_orchestrator_prompt()
