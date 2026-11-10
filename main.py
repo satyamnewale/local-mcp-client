@@ -1,17 +1,18 @@
 import asyncio
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from agent.graph import MCPAgent
 
+from config.limits import GRAPH_RECURSION_LIMIT
+
 
 async def main():
 
-    # Initialize agent
     agent = MCPAgent()
 
-    # Build LangGraph workflow and connect MCP tools
     graph = await agent.build()
 
     print("\n" + "=" * 50)
@@ -24,36 +25,55 @@ async def main():
 
         user_input = input("\nYou: ").strip()
 
-        if user_input.lower() in ["exit", "quit"]:
+        if user_input.lower() in {"exit", "quit"}:
             print("Exiting MCP Client...")
             break
 
         if not user_input:
             continue
 
-        # Add user message
+        previous_conversation = conversation.copy()
+
         conversation.append({
             "role": "user",
-            "content": user_input
+            "content": user_input,
         })
+
+        initial_state = {
+            "messages": conversation,
+
+            # Reset per-request execution counters.
+            "route": {},
+            "tool_calls_used": 0,
+            "reasoning_cycles": 0,
+            "retries_used": 0,
+            "failed_tool_names": [],
+            "limit_reached": False,
+        }
 
         try:
 
-            # Execute LangGraph
-            result = await graph.ainvoke({
-                "messages": conversation
-            })
+            result = await graph.ainvoke(
+                initial_state,
+                config={
+                    "recursion_limit": GRAPH_RECURSION_LIMIT
+                },
+            )
 
-            # Preserve conversation history
             conversation = result["messages"]
 
-            # Get final assistant response
             response = conversation[-1]
 
             print("\nAssistant:")
             print(response.content)
 
+            if result.get("limit_reached"):
+                print("\n[Execution stopped because a configured limit was reached.]")
+
         except Exception as error:
+
+            # Restore the previous history if this turn failed.
+            conversation = previous_conversation
 
             print(f"\nExecution Error: {error}")
 
