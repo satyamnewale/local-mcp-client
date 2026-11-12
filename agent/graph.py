@@ -1,20 +1,22 @@
 
-import json
-
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import ToolMessage
-from prompt.orchestrator import get_orchestrator_prompt
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 
 from agent.state import AgentState
+from agent.router import IntentRouter
+
 from client.mcp_client import MCPclient
+from client.execution_controller import ExecutionController
+
+from prompt.orchestrator import get_orchestrator_prompt
 
 from config.limits import (
     MAX_TOOL_CALLS,
     MAX_RETRIES,
-    MAX_REASONING_CYCLES
+    MAX_REASONING_CYCLES,
+    MAX_ROUTER_CONTEXT_MESSAGES,
 )
 
 
@@ -23,164 +25,228 @@ class MCPAgent:
     def __init__(self):
 
         self.mcp_client = MCPclient()
+        self.execution_controller = ExecutionController()
 
         self.model = ChatOpenAI(
             temperature=0,
-            model="gpt-4o-mini"
+            model="gpt-4o-mini",
         )
+
+        self.intent_router = IntentRouter(
+            ChatOpenAI(
+                temperature=0,
+                model="gpt-4o-mini",
+            )
+        )
+
+    @staticmethod
+    def get_router_context(messages: list) -> list:
+
+        context = []
+
+        for message in messages:
+
+            if isinstance(message, dict):
+
+                role = message.get("role")
+                content = message.get("content")
+
+            else:
+
+                message_type = getattr(message, "type", None)
+
+                role_map = {
+                    "human": "user",
+                    "ai": "assistant",
+                }
+
+                role = role_map.get(
+                    message_type,
+                    message_type,
+                )
+
+                content = getattr(message, "content", None)
+
+            if role not in ("user", "assistant"):
+                continue
+
+            if not content:
+                continue
+
+            context.append(message)
+
+        return context[-MAX_ROUTER_CONTEXT_MESSAGES:]
 
     async def build(self):
 
+        # --------------------------------------------------
         # 1. Discover MCP tools
-        tools = await self.mcp_client.get_tools()
+        # --------------------------------------------------
 
-        if not tools:
-            raise RuntimeError("No MCP tools were discovered.")
+        all_tools = await self.mcp_client.get_tools()
 
-        print("\nFound MCP tools:")
+        print("\nDiscovered MCP tools:")
 
-        for tool in tools:
-            print(f"- {tool.name}")
+        for tool in all_tools:
 
-        # 2. Bind tools to the model
-        model_with_tools = self.model.bind_tools(tools, parallel_tool_calls = False)
+            domain = self.mcp_client.get_tool_domain(
+                tool.name
+            )
 
-        # Create orchestration prompt
-        prompt = get_orchestrator_prompt()
+            print(
+                f"- {tool.name} [{domain or 'unclassified'}]"
+            )
 
-        # Agent chain
-        agent_chain = prompt | model_with_tools
+        # --------------------------------------------------
+        # 2. Intent router
+        # --------------------------------------------------
 
-        # 3. Initialize ToolNode
-        tool_node = ToolNode(tools)
+        async def route_intent(state: AgentState):
 
-        # 4. Agent node
-        async def call_model(state: AgentState):
-
-            response = await agent_chain.ainvoke(
+            context = self.get_router_context(
                 state["messages"]
             )
+
+            route = await self.intent_router.route(
+                context
+            )
+
+            print("\nWorkflow:", route["workflow"])
+            print("Domains:", route["domains"])
+
+            return {
+                "route": route
+            }
+
+        # --------------------------------------------------
+        # 3. Dynamic LLM reasoning
+        # --------------------------------------------------
+
+        async def call_executor(state: AgentState):
+
+            route = state.get("route", {})
+
+            workflow = route.get(
+                "workflow",
+                "general",
+            )
+
+            domains = route.get(
+                "domains",
+                [],
+            )
+
+            # Python selects tools available to this request.
+            available_tools = (
+                self.mcp_client.get_tools_for_domains(
+                    domains
+                )
+            )
+
+            prompt = get_orchestrator_prompt(
+                workflow,
+                domains,
+            )
+
+            # LLM dynamically chooses the next tool.
+            if available_tools:
+
+                model = self.model.bind_tools(
+                    available_tools,
+                    parallel_tool_calls=False,
+                )
+
+            else:
+
+                model = self.model
+
+            response = await (
+                prompt | model
+            ).ainvoke({
+                "messages": state["messages"]
+            })
 
             return {
                 "messages": [response],
                 "reasoning_cycles": (
                     state.get("reasoning_cycles", 0) + 1
-                )
+                ),
             }
 
-        # 5. Check execution limits
-        def route_after_agent(state: AgentState):
+        # --------------------------------------------------
+        # 4. Python controls tool execution
+        # --------------------------------------------------
+
+        async def execute_tools(state: AgentState):
+
+            last_message = state["messages"][-1]
+
+            route = state.get("route", {})
+            domains = route.get("domains", [])
+
+            available_tools = (
+                self.mcp_client.get_tools_for_domains(
+                    domains
+                )
+            )
+
+            result = await self.execution_controller.execute(
+                ai_message=last_message,
+                available_tools=available_tools,
+                state=state,
+            )
+
+            if result.get("limit_reached"):
+                print("\nTool-call limit reached.")
+
+            return result
+
+        # --------------------------------------------------
+        # 5. Decide next graph node
+        # --------------------------------------------------
+
+        def route_after_executor(state: AgentState):
 
             last_message = state["messages"][-1]
 
             tool_calls = getattr(
                 last_message,
                 "tool_calls",
-                []
+                [],
             )
 
-            # No tool calls: finish normally
+            # LLM has finished.
             if not tool_calls:
                 return "finish"
 
-            requested_calls = len(tool_calls)
-
-            # Reasoning cycle limit
-            if state.get("reasoning_cycles", 0) >= MAX_REASONING_CYCLES:
+            # Reasoning limit.
+            if (
+                state.get("reasoning_cycles", 0)
+                >= MAX_REASONING_CYCLES
+            ):
                 return "limit"
 
-            # Tool-call limit
+            # Tool-call limit.
             if (
                 state.get("tool_calls_used", 0)
-                + requested_calls
-                > MAX_TOOL_CALLS
+                >= MAX_TOOL_CALLS
             ):
                 return "limit"
 
-            # Retry limit
-            failed_names = state.get(
-                "failed_tool_names", []
-            )
+            return "execute"
 
-            pending_retries = sum(
-                call["name"] in failed_names
-                for call in tool_calls
-            )
+        def route_after_execution(state: AgentState):
 
-            if (
-                state.get("retries_used", 0)
-                + pending_retries
-                > MAX_RETRIES
-            ):
+            if state.get("limit_reached", False):
                 return "limit"
 
-            return "tools"
+            # Always return tool results to the LLM.
+            return "executor"
 
-        # 6. Controlled tool execution
-        async def run_tools(state: AgentState):
+        # --------------------------------------------------
+        # 6. Handle execution limits
+        # --------------------------------------------------
 
-            last_message = state["messages"][-1]
-            tool_calls = last_message.tool_calls
-
-            failed_names = list(
-                state.get("failed_tool_names", [])
-            )
-
-            retries_used = state.get("retries_used", 0)
-
-            # Count calls that repeat previously failed tools
-            retry_count = sum(
-                call["name"] in failed_names
-                for call in tool_calls
-            )
-
-            # Execute tools
-            result = await tool_node.ainvoke(state)
-
-            tool_messages = result["messages"]
-
-            # Map tool-call IDs to tool names
-            call_names = {
-                call["id"]: call["name"]
-                for call in tool_calls
-            }
-
-            # Track tool failures
-            for message in tool_messages:
-
-                tool_name = call_names.get(
-                    message.tool_call_id
-                )
-
-                if not tool_name:
-                    continue
-
-                if getattr(message, "status", "success") == "error":
-
-                    if tool_name not in failed_names:
-                        failed_names.append(tool_name)
-
-                else:
-
-                    if tool_name in failed_names:
-                        failed_names.remove(tool_name)
-
-            return {
-                "messages": tool_messages,
-
-                "tool_calls_used": (
-                    state.get("tool_calls_used", 0)
-                    + len(tool_calls)
-                ),
-
-                "retries_used": (
-                    retries_used + retry_count
-                ),
-
-                "failed_tool_names": failed_names
-            }
-
-        # 7. Handle exhausted execution limits
         async def handle_limit(state: AgentState):
 
             last_message = state["messages"][-1]
@@ -188,85 +254,110 @@ class MCPAgent:
             tool_calls = getattr(
                 last_message,
                 "tool_calls",
-                []
+                [],
             )
 
-            # Determine why execution stopped
-            if state.get("reasoning_cycles", 0) >= MAX_REASONING_CYCLES:
-                reason = "Maximum reasoning cycles reached."
+            blocked_messages = []
 
-            elif (
-                state.get("tool_calls_used", 0)
-                + len(tool_calls)
-                > MAX_TOOL_CALLS
-            ):
-                reason = "Maximum tool-call limit reached."
+            for call in tool_calls:
 
-            else:
-                reason = "Maximum retry limit reached."
-
-            print(f"\nExecution stopped: {reason}")
-
-            # Resolve pending tool calls so the message
-            # history remains valid for the next LLM call.
-            blocked_messages = [
-                ToolMessage(
-                    content=(
-                        f"Tool execution was blocked. {reason} "
-                        "Do not request more tools. "
-                        "Provide the best response using "
-                        "the information already available."
-                    ),
-                    tool_call_id=call["id"]
+                blocked_messages.append(
+                    ToolMessage(
+                        content=(
+                            "Execution stopped because a configured "
+                            "limit was reached. Do not call more tools. "
+                            "Explain what could and could not be completed."
+                        ),
+                        tool_call_id=call["id"],
+                        name=call["name"],
+                        status="error",
+                    )
                 )
-                for call in tool_calls
-            ]
 
             updated_messages = (
                 state["messages"] + blocked_messages
             )
 
-            # Generate final response WITHOUT tools
-            final_response = await (prompt | self.model).ainvoke(
-                updated_messages
+            route = state.get("route", {})
+
+            prompt = get_orchestrator_prompt(
+                route.get("workflow", "general"),
+                route.get("domains", []),
             )
+
+            # Final response without tools.
+            response = await (
+                prompt | self.model
+            ).ainvoke({
+                "messages": updated_messages
+            })
 
             return {
                 "messages": [
                     *blocked_messages,
-                    final_response
+                    response,
                 ],
-                "limit_reached": True
+                "limit_reached": True,
             }
 
-        # 8. Build LangGraph
+        # --------------------------------------------------
+        # 7. Build graph
+        # --------------------------------------------------
+
         builder = StateGraph(AgentState)
 
-        builder.add_node("agent", call_model)
-        builder.add_node("tools", run_tools)
-        builder.add_node("limit_handler", handle_limit)
-
-        # Starting point
-        builder.add_edge(START, "agent")
-
-        # Conditional routing
-        builder.add_conditional_edges(
-            "agent",
-            route_after_agent,
-            {
-                "tools": "tools",
-                "limit": "limit_handler",
-                "finish": END
-            }
+        builder.add_node(
+            "router",
+            route_intent,
         )
 
-        # Tool results return to agent
-        builder.add_edge("tools", "agent")
+        builder.add_node(
+            "executor",
+            call_executor,
+        )
 
-        # Limit handler returns final answer
-        builder.add_edge("limit_handler", END)
+        builder.add_node(
+            "execute",
+            execute_tools,
+        )
 
-        # Compile graph
-        graph = builder.compile()
+        builder.add_node(
+            "limit_handler",
+            handle_limit,
+        )
 
-        return graph
+        builder.add_edge(
+            START,
+            "router",
+        )
+
+        builder.add_edge(
+            "router",
+            "executor",
+        )
+
+        builder.add_conditional_edges(
+            "executor",
+            route_after_executor,
+            {
+                "execute": "execute",
+                "limit": "limit_handler",
+                "finish": END,
+            },
+        )
+
+        builder.add_conditional_edges(
+            "execute",
+            route_after_execution,
+            {
+                "executor": "executor",
+                "limit": "limit_handler",
+            },
+        )
+
+        builder.add_edge(
+            "limit_handler",
+            END,
+        )
+
+        return builder.compile()
