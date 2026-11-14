@@ -10,4 +10,5 @@ dependencies = [
     "langchain-openai>=1.7.3",
     "langgraph>=1.2.19",
     "python-dotenv>=1.2.4",
+    "tzdata>=2026.6",
 ]
